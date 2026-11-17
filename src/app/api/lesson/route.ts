@@ -61,71 +61,129 @@ Omit action properties that do not apply to that action type.
 Return only schema-compliant lesson data. Do not include markdown.
 `;
 
+function prepareGeneratedLesson(value: unknown, topic: string) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+
+  const raw = value as Record<string, unknown>;
+  const rawSegments = Array.isArray(raw.segments) ? raw.segments : [];
+  const segments = rawSegments.map((segment, segmentIndex) => {
+    if (!segment || typeof segment !== "object" || Array.isArray(segment)) return segment;
+
+    const rawSegment = segment as Record<string, unknown>;
+    const rawActions = Array.isArray(rawSegment.actions) ? rawSegment.actions : [];
+    const actions = rawActions.map((action, actionIndex) => {
+      if (!action || typeof action !== "object" || Array.isArray(action)) return action;
+
+      return {
+        id: `segment-${segmentIndex + 1}-action-${actionIndex + 1}`,
+        atMs: 0,
+        x: 500,
+        y: 280,
+        ...(action as Record<string, unknown>),
+      };
+    });
+
+    return {
+      id: `segment-${segmentIndex + 1}`,
+      startMs: 0,
+      ...rawSegment,
+      actions,
+    };
+  });
+  const generatedId = topic
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 64) || "generated-lesson";
+  const calculatedDuration = segments.reduce((total, segment) => {
+    if (!segment || typeof segment !== "object" || Array.isArray(segment)) return total;
+    const duration = Number((segment as Record<string, unknown>).durationMs);
+    return total + (Number.isFinite(duration) ? duration : 0);
+  }, 0);
+
+  return {
+    id: generatedId,
+    topic,
+    durationMs: calculatedDuration || 90_000,
+    ...raw,
+    segments,
+  };
+}
+
 export async function POST(request: Request) {
+  let body: z.infer<typeof requestSchema>;
+
   try {
-    const body = requestSchema.parse(await request.json());
-    const apiKey = process.env.GEMINI_API_KEY;
+    body = requestSchema.parse(await request.json());
+  } catch {
+    return Response.json(
+      { code: "INVALID_TOPIC", error: "Enter a clear topic using at least three characters." },
+      { status: 400 },
+    );
+  }
 
-    if (!apiKey) {
-      return Response.json(
-        {
-          code: "GEMINI_NOT_CONFIGURED",
-          error:
-            "Live AI is not configured yet. Add GEMINI_API_KEY to generate a custom lesson.",
-        },
-        { status: 503 },
-      );
-    }
+  const apiKey = process.env.GEMINI_API_KEY;
 
+  if (!apiKey) {
+    return Response.json(
+      {
+        code: "GEMINI_NOT_CONFIGURED",
+        error: "Live AI is not configured yet. Add GEMINI_API_KEY to generate a custom lesson.",
+      },
+      { status: 503 },
+    );
+  }
+
+  try {
     const ai = new GoogleGenAI({
       apiKey,
       httpOptions: { apiVersion: "v1beta" },
     });
     const contents = `Teach this topic visually: ${body.topic}`;
-    const config = {
-      systemInstruction,
-      responseMimeType: "application/json",
-      temperature: 0.65,
-      maxOutputTokens: 8_000,
-    };
-    let response;
+    const attempts = [
+      { model: "gemini-3-flash-preview", temperature: 0.55 },
+      { model: "gemini-3.1-flash-lite", temperature: 0.35 },
+      { model: "gemini-3.1-flash-lite", temperature: 0.15 },
+    ];
+    let lastError: unknown;
 
-    try {
-      response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents,
-        config,
-      });
-    } catch (primaryError) {
-      console.warn("Gemini 3 Flash unavailable; using Flash Lite fallback", primaryError);
-      response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-lite",
-        contents,
-        config,
-      });
+    for (const attempt of attempts) {
+      try {
+        const response = await ai.models.generateContent({
+          model: attempt.model,
+          contents,
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            temperature: attempt.temperature,
+            maxOutputTokens: 8_000,
+          },
+        });
+
+        if (!response.text) {
+          throw new Error(`${attempt.model} returned an empty lesson.`);
+        }
+
+        const prepared = prepareGeneratedLesson(JSON.parse(response.text), body.topic);
+        const parsed = lessonSchema.parse(prepared);
+        const lesson = normalizeLesson(parsed);
+
+        return Response.json({ lesson, source: "gemini", model: attempt.model });
+      } catch (error) {
+        lastError = error;
+        console.warn(`Lesson attempt with ${attempt.model} failed`, error);
+      }
     }
 
-    if (!response.text) {
-      throw new Error("Gemini returned an empty lesson.");
-    }
-
-    const parsed = lessonSchema.parse(JSON.parse(response.text));
-    const lesson = normalizeLesson({ ...parsed, topic: body.topic });
-
-    return Response.json({ lesson, source: "gemini" });
+    throw lastError ?? new Error("Gemini could not generate a valid lesson.");
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      console.error("Gemini lesson failed validation", JSON.stringify(error.issues));
-      return Response.json(
-        { code: "INVALID_LESSON", error: "The lesson data was incomplete. Please try again." },
-        { status: 422 },
-      );
-    }
-
     console.error("Lesson generation failed", error);
     return Response.json(
-      { code: "GENERATION_FAILED", error: "We could not build that lesson. Please try a clearer topic." },
-      { status: 500 },
+      {
+        code: "GENERATION_FAILED",
+        error: "The AI could not structure that lesson. Please try the topic once more.",
+      },
+      { status: 502 },
     );
   }
 }
